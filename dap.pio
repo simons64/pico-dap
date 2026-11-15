@@ -1,0 +1,74 @@
+.pio_version 0 // only requires PIO version 0
+
+.program dap
+; .side_set 1 opt
+
+; Program puts out clock for DAP interface
+
+; Square wave on the configured SET pin group.
+; Period = 2 SM cycles (1 high + 1 low).
+    set pins, 1
+    set pins, 0
+
+
+
+;    pull       side 1 [7]  ; Assert stop bit, or stall with line in idle state
+;    set x, 7   side 0 [7]  ; Preload bit counter, assert start bit for 8 clocks
+;bitloop:                   ; This loop will run 8 times (8n1 UART)
+;    out pins, 1            ; Shift 1 bit from OSR to the first OUT pin
+;    jmp x-- bitloop   [6]  ; Each loop iteration is 8 cycles.
+
+
+% c-sdk {
+#include "hardware/clocks.h"
+
+static inline void dap_program_init(PIO pio, uint sm, uint offset, uint pin_tx, uint freq_hz) {
+    // Tell PIO to initially drive output-high on the selected pin, then map PIO
+    // onto that pin with the IO muxes.
+    pio_sm_set_pins_with_mask64(pio, sm, 1ull << pin_tx, 1ull << pin_tx);
+    pio_sm_set_pindirs_with_mask64(pio, sm, 1ull << pin_tx, 1ull << pin_tx);
+    pio_gpio_init(pio, pin_tx);
+
+    pio_sm_config c = dap_program_get_default_config(offset);
+    sm_config_set_set_pins(&c, pin_tx, 1);
+
+    // OUT shifts to right, no autopull
+    //sm_config_set_out_shift(&c, true, false, 32);
+
+    // We are mapping both OUT and side-set to the same pin, because sometimes
+    // we need to assert user data onto the pin (with OUT) and sometimes
+    // assert constant values (start/stop bit)
+    //sm_config_set_out_pins(&c, pin_tx, 1);
+    //sm_config_set_sideset_pins(&c, pin_tx);
+
+    // We only need TX, so get an 8-deep FIFO!
+    //sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+
+    // Two 1-cycle instructions per period, so the square wave runs at half the
+    // state machine clock: f_out = clk_sys / (div * 2), i.e.
+    //     div = clk_sys / (2 * freq_hz)
+    // The divider is 16.8 fixed point and only valid in [1, 65536]. Clamp
+    // explicitly: sm_config_set_clkdiv() merely asserts (compiled out in
+    // release) and otherwise truncates an out-of-range value modulo 2^16,
+    // silently producing a completely different frequency.
+    float div = (float)clock_get_hz(clk_sys) / (2.0f * (float)freq_hz);
+    if (div < 1.0f) div = 1.0f;
+    if (div > 65536.0f) div = 65536.0f;
+    sm_config_set_clkdiv(&c, div);
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+
+
+}
+
+static inline void uart_tx_program_putc(PIO pio, uint sm, char c) {
+    pio_sm_put_blocking(pio, sm, (uint32_t)c);
+}
+
+static inline void uart_tx_program_puts(PIO pio, uint sm, const char *s) {
+    while (*s)
+        uart_tx_program_putc(pio, sm, *s++);
+}
+
+%}
