@@ -1,22 +1,13 @@
 .pio_version 0 // only requires PIO version 0
 
 .program dap
-; .side_set 1 opt
-
+.side_set 2 opt
 ; Program puts out clock for DAP interface
-
-; Square wave on the configured SET pin group.
-; Period = 2 SM cycles (1 high + 1 low).
-    set pins, 1
-    set pins, 0
-
-
-
-;    pull       side 1 [7]  ; Assert stop bit, or stall with line in idle state
-;    set x, 7   side 0 [7]  ; Preload bit counter, assert start bit for 8 clocks
-;bitloop:                   ; This loop will run 8 times (8n1 UART)
-;    out pins, 1            ; Shift 1 bit from OSR to the first OUT pin
-;    jmp x-- bitloop   [6]  ; Each loop iteration is 8 cycles.
+    pull       side 1 [3]  ; 
+    set x, 31  side 0 [3]  ; 32 bits from FIFO
+bitloop:                   
+    out pins, 1            ; Shift 1 bit from OSR to the first OUT pin
+    jmp x-- bitloop   [2]  ; Each loop iteration is 8 cycles.
 
 
 % c-sdk {
@@ -30,27 +21,24 @@ static inline void dap_program_init(PIO pio, uint sm, uint offset, uint pin_tx, 
     pio_gpio_init(pio, pin_tx);
 
     pio_sm_config c = dap_program_get_default_config(offset);
-    sm_config_set_set_pins(&c, pin_tx, 1);
+    
+    
+    //sm_config_set_set_pins(&c, pin_tx, 1);
 
     // OUT shifts to right, no autopull
-    //sm_config_set_out_shift(&c, true, false, 32);
+    sm_config_set_out_shift(&c, true, false, 32);
 
     // We are mapping both OUT and side-set to the same pin, because sometimes
     // we need to assert user data onto the pin (with OUT) and sometimes
     // assert constant values (start/stop bit)
-    //sm_config_set_out_pins(&c, pin_tx, 1);
-    //sm_config_set_sideset_pins(&c, pin_tx);
+    sm_config_set_out_pins(&c, pin_tx, 1);
+    //sm_config_set_out_pins(&c, pin_tx+1, 1);
+    sm_config_set_sideset_pins(&c, pin_tx+1);
 
     // We only need TX, so get an 8-deep FIFO!
-    //sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
 
-    // Two 1-cycle instructions per period, so the square wave runs at half the
-    // state machine clock: f_out = clk_sys / (div * 2), i.e.
-    //     div = clk_sys / (2 * freq_hz)
-    // The divider is 16.8 fixed point and only valid in [1, 65536]. Clamp
-    // explicitly: sm_config_set_clkdiv() merely asserts (compiled out in
-    // release) and otherwise truncates an out-of-range value modulo 2^16,
-    // silently producing a completely different frequency.
+    // state machine frequency
     float div = (float)clock_get_hz(clk_sys) / (2.0f * (float)freq_hz);
     if (div < 1.0f) div = 1.0f;
     if (div > 65536.0f) div = 65536.0f;
