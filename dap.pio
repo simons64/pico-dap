@@ -3,55 +3,53 @@
 .program dap
 .side_set 1 opt
 
-    pull               side 0 [1]  ; next word; stalls while the FIFO is empty
-    set pindirs, 1     side 0 [1]  ; data pin OUTPUT
+    pull               side 0 ; next word; stalls while the FIFO is empty
+    set pindirs, 1     side 0 ; data pin OUTPUT
     
-    set x, 5           side 0 [1]
+    set x, 5           side 0 
 cmd_loop:
     out pins, 1        side 0 [1]
-    nop                side 1 [3]
-    jmp x-- cmd_loop   side 0 [1]  ; clock low (2 + 2 cycles from OUT)
+    jmp x-- cmd_loop   side 1 [1]
 
+    mov isr, null      side 0
 
-    mov isr, null
-    set x, 5           side 0 [1]
+    set x, 5           side 0
 cmd_loop2:
     in  osr, 1
     out pins, 1        side 0 [1]
-    nop                side 1 [3]
-    jmp x-- cmd_loop2  side 0 [1]  ; clock low (2 + 2 cycles from OUT)
-    in  null, 26
-    mov y, isr 
+    jmp x-- cmd_loop2  side 1
+    
+    in  null, 26       side 1
+    mov y, isr         side 0
 
-    set x, 6           side 0 [7]  ; 19 driven clocks
+    set x, 5           side 0
 tx_loop:
-    out pins, 1        side 0 [1]  ; drive data bit, clock low
-    nop                side 1 [3]  ; clock high (4 cycles)
-    jmp x-- tx_loop    side 0 [1]  ; clock low (2 + 2 cycles from OUT)
+    out pins, 1        side 0 [1]
+    jmp x-- tx_loop    side 1 [1]
+
 
     ; Data pin becomes an input: the PIO stops driving DAP1 so the target can.
-    set pindirs, 0     side 0 [2]  ; release the data pin
+    set pindirs, 0         side 0 [7]
     
-    ; wait for input start bit   
+
     set x, 10   ; 10 is a random guess
 wait_start_bit:
-    jmp pin start_bit      side 0 [2]  ; 
-    jmp x-- wait_start_bit side 1 [2]  ; clock low
+    jmp pin start_bit      side 1 [1]
+    jmp x-- wait_start_bit side 0 [1]
 
 start_bit:
+    mov isr, null          side 0 [3]
+wait_tx_len:
+    in pins, 1             side 1 [1]
+    push iffull            side 0
+    jmp y-- wait_tx_len    side 0
 
-    mov isr, null
-rx_loop_a:
-    in pins, 1         side 1 [3]  ; clock high (4 cycles)
-    push iffull
-    jmp y-- rx_loop_a  side 0 [2]  ; clock low
-
-    push                      [1]
+    push
 
     ; Put the idle level (high) in the output latch *before* re-enabling the
     ; driver, otherwise re-driving would repeat the last data bit.
-    set pins, 1        side 0 [1]  ; idle high while still an input
-    set pindirs, 1     side 0 [1]  ; data pin OUTPUT again
+    set pins, 1        ; idle high while still an input
+    set pindirs, 1     ; data pin OUTPUT again
 
 
 % c-sdk {
@@ -75,6 +73,9 @@ static inline void dap_program_init(PIO pio, uint sm, uint offset, uint pin_data
     sm_config_set_out_pins(&c, pin_data, 1);
     sm_config_set_sideset_pins(&c, pin_clk);
 
+    sm_config_set_in_pins(&c, pin_data);
+    sm_config_set_jmp_pin(&c, pin_data);
+
     // SET PINDIRS targets the same pin as OUT, so the program can switch the
     // data pin between output (driven bits) and input (released).
     sm_config_set_set_pins(&c, pin_data, 1);
@@ -95,15 +96,6 @@ static inline void dap_program_init(PIO pio, uint sm, uint offset, uint pin_data
 
     pio_sm_init(pio, sm, offset, &c);
     pio_sm_set_enabled(pio, sm, true);
-}
-
-static inline void uart_tx_program_putc(PIO pio, uint sm, char c) {
-    pio_sm_put_blocking(pio, sm, (uint32_t)c);
-}
-
-static inline void uart_tx_program_puts(PIO pio, uint sm, const char *s) {
-    while (*s)
-        uart_tx_program_putc(pio, sm, *s++);
 }
 
 %}

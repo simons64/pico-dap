@@ -19,7 +19,7 @@ static uint dma_channel_burst;
 #define DMA_IRQ_TO_USE 0
 
 
-#define BUFFER_SIZE 2
+#define BUFFER_SIZE 1
 uint32_t buffer_burst[BUFFER_SIZE] = {0};
 
 
@@ -33,7 +33,7 @@ int main()
     // }
     //buffer_burst[0] = 0b100001111111100100;
     buffer_burst[0] = 0b001001111111100001;
-    buffer_burst[1] = 0;
+    //buffer_burst[1] = 0;
     // buffer_burst[BUFFER_SIZE-1] = 0xFFFFFFFF;
 
 
@@ -67,14 +67,23 @@ int main()
 
     printf("DMA transfer finished\n");
     
-    uint32_t ret = pio_sm_get_blocking(pio_hw_dap, pio_sm_dap);
-    printf("ret: %x\n", ret);
-    ret = pio_sm_get_blocking(pio_hw_dap, pio_sm_dap);
-    printf("ret: %x\n", ret);
-    ret = pio_sm_get_blocking(pio_hw_dap, pio_sm_dap);
-    printf("ret: %x\n", ret);
-    ret = pio_sm_get_blocking(pio_hw_dap, pio_sm_dap);
-    printf("ret: %x\n", ret);
+    uint32_t RX_FIFO1 = pio_sm_get_blocking(pio_hw_dap, pio_sm_dap);
+    printf("RX_FIFO1: 0x%X\n", RX_FIFO1);
+    uint32_t RX_FIFO2 = pio_sm_get_blocking(pio_hw_dap, pio_sm_dap);
+    printf("RX_FIFO2: 0x%X\n", RX_FIFO2);
+
+    // start bit cut off
+    uint8_t cmd = RX_FIFO1 & 0x1F;
+    uint8_t len = (RX_FIFO1 >> 5) & 0x3F;
+    uint32_t arg = (RX_FIFO1 >> 11) & 0x1FFFFF;
+    uint8_t crc = RX_FIFO2 & 0x3F;
+
+    printf("cmd: 0x%02X\n", cmd);
+    printf("len: 0x%02X (%d)\n", len, len);
+    printf("arg: 0x%02X\n", arg);
+    printf("crc: 0x%02X\n", crc);
+
+
 
     // Never return from main: the SDK's _exit() locks the core on bkpt and
     // the board then needs BOOTSEL to be flashed again.
