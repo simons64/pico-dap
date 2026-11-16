@@ -202,23 +202,34 @@ static dap_reply_t dap_request(uint8_t cmd, uint32_t arglen, uint64_t arg, uint3
 {
     dap_reply_t r = {0};
 
-    // because of sync()
-    if(arglen == DAP_NO_ARG) r.tx_len = 17;
-    else r.tx_len = 17 + arglen;
+    // A frame is start(1) + cmd(5) + len(6) + arg + crc6(6) = 18 bits without an
+    // argument, and the PIO's bit loop sends exactly this many bits (its
+    // `jmp x-- / jmp done` pair is not the N+1 form).
+    r.tx_len = 18 + (arglen == DAP_NO_ARG ? 0u : arglen);
 
     tx_words[0] = (reslen+18+32 << 7) | r.tx_len;
     r.tx = dap_build_frame(cmd, arglen, arg);
     tx_words[1] = (uint32_t) (r.tx & 0xFFFFFFFF);
     tx_words[2] = (uint32_t) ((r.tx >> 32) & 0xFFFFFFFF);
 
+    // The state machine pulls one metadata word plus one word per 32 frame bits,
+    // and stops there: queue exactly that many, or the leftover word sits in the
+    // TX FIFO and is taken as the metadata of the next request (X and Y then
+    // decode as garbage and the reply never arrives). This is why two consecutive
+    // dap_sync() calls failed while re-running dap_init() "fixed" it - dap_init()
+    // clears the FIFOs.
+    unsigned ntx = 1u + (r.tx_len + 31u) / 32u;
+    if (ntx > DAP_TX_WORDS) {
+        r.status = DAP_ERR_TX_BITS;
+        return r;
+    }
+
     // The state machine pushes one word more than the reply needs whenever the
     // clocked bit count is a multiple of 32 (two full words plus its trailing
-    // `push`), so a word is left in the RX FIFO after every transaction. Park the
-    // SM at the wrap (`pull`) and drop whatever is there, otherwise that stale
-    // word is consumed as the first word of this reply and everything after the
-    // first request decodes shifted by 32 bits. `dap_init()` used to hide this by
-    // clearing the FIFOs.
-    for (uint32_t spins = 0; pio_sm_get_pc(pio_dap, sm_dap) != offset_dap; spins++) {
+    // `push`), so a word can be left in the RX FIFO. Wait until it is parked at
+    // its metadata `pull` (address 1 - the program starts with `set pindirs, 1`)
+    // and drop whatever is there.
+    for (uint32_t spins = 0; pio_sm_get_pc(pio_dap, sm_dap) != offset_dap + 1; spins++) {
         if (spins > 1000000u) // never spin forever if the SM is wedged
             break;
         tight_loop_contents();
@@ -233,7 +244,7 @@ static dap_reply_t dap_request(uint8_t cmd, uint32_t arglen, uint64_t arg, uint3
     dma_channel_transfer_to_buffer_now(dma_rx, rx_words,
                                        dma_encode_transfer_count(DAP_RX_WORDS));
     dma_channel_transfer_from_buffer_now(dma_tx, tx_words,
-                                         dma_encode_transfer_count(DAP_TX_WORDS));
+                                         dma_encode_transfer_count(ntx));
 
     absolute_time_t deadline = make_timeout_time_ms(DAP_REQUEST_TIMEOUT_MS);
     while (dma_channel_is_busy(dma_rx)) {
