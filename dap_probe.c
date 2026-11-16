@@ -12,25 +12,29 @@
 static PIO pio_hw_dap;
 static uint pio_sm_dap;
 static uint offset_dap;
-#define GPIO_DAP_DATA 0
-#define GPIO_DAP_CLK  1
+#define GPIO_DAP_DATA 1
+#define GPIO_DAP_CLK  0
 
 static uint dma_channel_burst;
 #define DMA_IRQ_TO_USE 0
 
 
-#define BUFFER_SIZE 512
+#define BUFFER_SIZE 2
 uint32_t buffer_burst[BUFFER_SIZE] = {0};
 
 
 int main()
 {
-    for(uint32_t i=0; i<BUFFER_SIZE; ++i) {
-        // if ((i % 2) == 0) buffer_burst[i] = 0xFF;
-        // else buffer_burst[i] = 0;
-        buffer_burst[i] = i;
-    }
-    buffer_burst[BUFFER_SIZE-1] = 0xFFFFFFFF;
+
+    // for(uint32_t i=0; i<BUFFER_SIZE; ++i) {
+    //     // if ((i % 2) == 0) buffer_burst[i] = 0xFF;
+    //     // else buffer_burst[i] = 0;
+    //     buffer_burst[i] = i;
+    // }
+    //buffer_burst[0] = 0b100001111111100100;
+    buffer_burst[0] = 0b001001111111100001;
+    buffer_burst[1] = 0;
+    // buffer_burst[BUFFER_SIZE-1] = 0xFFFFFFFF;
 
 
     stdio_init_all();
@@ -41,7 +45,7 @@ int main()
     if (!pio_claim_free_sm_and_add_program_for_gpio_range(&dap_program, &pio_hw_dap, &pio_sm_dap, &offset_dap, GPIO_DAP_DATA, 2, true)) {
         panic("failed to allocate pio for rx");
     }
-    dap_program_init(pio_hw_dap, pio_sm_dap, offset_dap, GPIO_DAP_DATA, GPIO_DAP_CLK, 10000);
+    dap_program_init(pio_hw_dap, pio_sm_dap, offset_dap, GPIO_DAP_DATA, GPIO_DAP_CLK, 50000);
     
     dma_channel_burst = dma_claim_unused_channel(true);
     dma_channel_config dma_config = dma_channel_get_default_config(dma_channel_burst);
@@ -62,11 +66,22 @@ int main()
     dma_channel_wait_for_finish_blocking(dma_channel_burst);
 
     printf("DMA transfer finished\n");
+    
+    uint32_t ret = pio_sm_get_blocking(pio_hw_dap, pio_sm_dap);
+    printf("ret: %x\n", ret);
+    ret = pio_sm_get_blocking(pio_hw_dap, pio_sm_dap);
+    printf("ret: %x\n", ret);
+    ret = pio_sm_get_blocking(pio_hw_dap, pio_sm_dap);
+    printf("ret: %x\n", ret);
+    ret = pio_sm_get_blocking(pio_hw_dap, pio_sm_dap);
+    printf("ret: %x\n", ret);
 
     // Never return from main: the SDK's _exit() locks the core on bkpt and
     // the board then needs BOOTSEL to be flashed again.
+    int k = 0;
     while (true) {
-        printf("Hello, cruel world\n");
+        printf("running %d   \r", k);
+        k++;
         sleep_ms(1000);
     }
 }

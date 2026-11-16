@@ -5,6 +5,8 @@
 #   ./flash.sh -b         build first, then flash
 #   ./flash.sh foo.uf2    flash a specific image
 #
+# macOS only: on Linux use ./flash-ubuntu.sh (ports and mount points differ).
+#
 # A running board is rebooted into BOOTSEL via the 1200-baud touch, so the
 # BOOTSEL button is only needed if the board has no USB stdio firmware.
 set -eu

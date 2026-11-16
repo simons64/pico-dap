@@ -8,12 +8,75 @@
 ; DAP output: data on the OUT pin, clock on the side-set pin.
 ; Data is shifted out LSB first, one clock pulse per data bit.
 ; Clock idles low.
-    pull             side 0 [1]  ; wait for the next 32-bit word, clock low
-    set x, 31        side 0 [1]  ; 32 data bits per FIFO word
-bitloop:
-    out pins, 1      side 0 [1]  ; drive data bit, clock low
-    nop              side 1 [3]  ; clock high (4 cycles)
-    jmp x-- bitloop  side 0 [1]  ; clock low (2 + 2 cycles from OUT)
+;
+; Transaction shape (one 32-bit FIFO word per transaction):
+;
+;   clocks  1..20   data pin OUTPUT, bit shifted LSB-first out of the word
+;   clocks 21..76   data pin INPUT (PIO releases it, the target may drive)
+;   then            data pin OUTPUT again, line idles high, next word pulled
+;
+; Only the low 20 bits of each FIFO word are used; OUT shifts the word right,
+; so bits 31:20 are discarded by the next PULL. Every clock period is 8 SM
+; cycles in both phases, so the released phase runs at the same clock rate as
+; the driven one (freq_hz = clk_sys / (div * 8) still holds).
+    pull               side 0 [1]  ; next word; stalls while the FIFO is empty
+    set pindirs, 1     side 0 [1]  ; data pin OUTPUT
+    ; JMP X-- tests X before decrementing, so a loop entered with X = n runs
+    ; n + 1 times: X = 19 - 1 gives the 18 driven clocks.
+    
+    set x, 5           side 0 [1]
+cmd_loop:
+    out pins, 1        side 0 [1]
+    nop                side 1 [3]
+    jmp x-- cmd_loop   side 0 [1]  ; clock low (2 + 2 cycles from OUT)
+
+
+    mov isr, null
+    set x, 5           side 0 [1]
+cmd_loop2:
+    in  osr, 1
+    out pins, 1        side 0 [1]
+    nop                side 1 [3]
+    jmp x-- cmd_loop2  side 0 [1]  ; clock low (2 + 2 cycles from OUT)
+    in  null, 26
+    mov y, isr 
+
+    set x, 6           side 0 [7]  ; 19 driven clocks
+tx_loop:
+    out pins, 1        side 0 [1]  ; drive data bit, clock low
+    nop                side 1 [3]  ; clock high (4 cycles)
+    jmp x-- tx_loop    side 0 [1]  ; clock low (2 + 2 cycles from OUT)
+
+
+    ; Data pin becomes an input: the PIO stops driving DAP1 so the target can.
+    set pindirs, 0     side 0 [2]  ; release the data pin
+    
+    ; wait for input start bit   
+    set x, 10   ;
+wait_start_bit:
+    jmp pin start_bit      side 0 [2]  ; 
+    jmp x-- wait_start_bit side 1 [2]  ; clock low
+
+start_bit:
+;    set x, 11              side 0 [7]  ;
+;in_cmd_loop:
+;    ;nop                   side 0 [1]  ; drive data bit, clock low
+;    in  pins, 1            side 1 [3]  ; clock high (4 cycles)
+;    jmp x-- in_cmd_loop    side 0 [2]  ; clock low (2 + 2 cycles from OUT)
+
+
+    mov isr, null
+rx_loop_a:
+    in pins, 1         side 1 [3]  ; clock high (4 cycles)
+    push iffull
+    jmp y-- rx_loop_a  side 0 [2]  ; clock low
+
+    push                      [1]
+
+    ; Put the idle level (high) in the output latch *before* re-enabling the
+    ; driver, otherwise re-driving would repeat the last data bit.
+    set pins, 1        side 0 [1]  ; idle high while still an input
+    set pindirs, 1     side 0 [1]  ; data pin OUTPUT again
 
 
 % c-sdk {
@@ -37,8 +100,12 @@ static inline void dap_program_init(PIO pio, uint sm, uint offset, uint pin_data
     sm_config_set_out_pins(&c, pin_data, 1);
     sm_config_set_sideset_pins(&c, pin_clk);
 
+    // SET PINDIRS targets the same pin as OUT, so the program can switch the
+    // data pin between output (driven bits) and input (released).
+    sm_config_set_set_pins(&c, pin_data, 1);
+
     // We only need TX, so get an 8-deep FIFO!
-    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_NONE);
 
     // One data bit (one clock period) takes 8 SM cycles, so
     //     freq_hz = clk_sys / (div * 8)
