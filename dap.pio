@@ -30,19 +30,27 @@ tx_loop:
 
     ; Data pin becomes an input: the PIO stops driving DAP1 so the target can.
     set pindirs, 0         side 0 [7]
-    
 
+    ; Clear the ISR before the wait loop, not after the start bit: the reply's
+    ; start bit is its first bit, so nothing may be clocked in before the input
+    ; shift counter is back at 0.
+    mov isr, null          side 0
+
+    ; Wait for the reply's start bit on DAP1. Sample it while the clock is LOW:
+    ; the target presents each bit ~40 ns after a rising edge, so a low-phase
+    ; sample sees the bit that the *previous* edge produced. Jumping straight
+    ; into the loop body then lets `in` rise the clock and capture that same bit
+    ; (an `in` samples at its first cycle, so it must also own the rising edge;
+    ; if the jump rose the clock instead, the start bit would be clocked away).
     set x, 10   ; 10 is a random guess
 wait_start_bit:
-    jmp pin start_bit      side 1 [1]
-    jmp x-- wait_start_bit side 0 [1]
+    jmp pin rx_loop        side 0 [1]
+    jmp x-- wait_start_bit side 1 [1]
 
-start_bit:
-    mov isr, null          side 0 [3]
-wait_tx_len:
+rx_loop:
     in pins, 1             side 1 [1]
     push iffull            side 0
-    jmp y-- wait_tx_len    side 0
+    jmp y-- rx_loop        side 0
 
     push
 
@@ -80,7 +88,8 @@ static inline void dap_program_init(PIO pio, uint sm, uint offset, uint pin_data
     // data pin between output (driven bits) and input (released).
     sm_config_set_set_pins(&c, pin_data, 1);
 
-    // We only need TX, so get an 8-deep FIFO!
+    // 4 TX + 4 RX entries. The RX side is drained by DMA, so the 4-entry
+    // depth does not limit the length of a response.
     sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_NONE);
 
     // One data bit (one clock period) takes 8 SM cycles, so
