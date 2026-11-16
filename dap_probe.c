@@ -302,6 +302,23 @@ int main(void)
     dap_reply_t r = dap_sync();
     dap_print_reply(&r);
 
+    dap_reply_t r2 = dap_sync();
+    dap_print_reply(&r2);
+
+    // batch.dap_dapisc(48, 0x4ABBAF530F00)
+    // batch.exec()
+    //dap_reply_t r2 = dap_request(17, 48, 0x4ABBAF530F00);
+    //dap_print_reply(&r2);
+
+    // batch.dap_telegram(21, 0, None, 3)          # jtag_reset
+    // batch.exec()
+    // batch.dap_telegram(28, 2, 1, 3)             # io client 1
+    // batch.exec()
+    // first = status()
+    // second = status()
+    // batch.dap_write_ojconf(0x3)
+    // batch.exec()
+
     // Never return from main: the SDK's _exit() locks the core on bkpt and
     // the board then needs BOOTSEL to be flashed again.
     int k = 0;
