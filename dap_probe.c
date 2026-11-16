@@ -11,13 +11,27 @@
 #define GPIO_DAP_DATA 1
 #define GPIO_DAP_CLK  0
 
-#define DAP_TX_WORDS 3
+// The command stream is word 0 = metadata (two counts) followed by the frame,
+// which spans one word per 32 bits: a 66-bit dapisc frame needs three data
+// words, so 96 bits are available for the frame.
+#define DAP_TX_DATA_WORDS 3
+#define DAP_TX_WORDS      (1 + DAP_TX_DATA_WORDS)
+
 // The state machine clocks DAP_RX_BITS reply bits back in, which fills two
 // FIFO words. Both are drained by DMA.
 #define DAP_RX_WORDS 2
 
-// arglen value meaning "this command has no argument" (an 18-bit frame).
+// arglen value meaning "this command has no argument".
 #define DAP_NO_ARG 0x3F
+
+// Bits a frame occupies besides its argument: start(1) + cmd(5) + arglen(6) +
+// crc6(6). Same arithmetic as TricoreDapAnalyzer's `12 + arg_len + 6`.
+#define DAP_FRAME_BITS 18
+
+// Argument bits in a frame. arglen 0x3f is the "no argument" marker, not 63
+// bits - TricoreDapAnalyzer does `len == 63 ? 0 : len` for exactly this reason,
+// and using it raw would make every argument-less frame 63 bits too long.
+#define DAP_ARG_BITS(arglen) ((arglen) == DAP_NO_ARG ? 0u : (uint32_t)(arglen))
 
 #define DAP_REQUEST_TIMEOUT_MS 100
 
@@ -109,20 +123,75 @@ static dap_frame_t dap_parse_frame(uint64_t bits)
     return f;
 }
 
-// Pack CMD / LEN / ARG into the bit stream the state machine shifts out:
-// start bit at bit 0, then cmd, len, arg (LSB-first each) and the CRC on top.
-static uint64_t dap_build_frame(uint8_t cmd, uint32_t arglen, uint64_t arg)
-{
-    uint32_t narg = (arglen == DAP_NO_ARG) ? 0u : arglen;
-    uint64_t f = 1u;
-    f |= (uint64_t)(cmd & 0x1Fu) << 1;
-    f |= (uint64_t)(arglen & 0x3Fu) << 6;
-    if (narg != 0 && narg <= 46)
-        f |= (arg & ((1ull << narg) - 1u)) << 12;
+// ---------------------------------------------------------------------------
+// The command frame spans several words, so it has no single-register form: a
+// 66-bit dapisc frame does not fit in a uint64_t. Bits are written and read at a
+// bit position across the data words, LSB of word 0 first.
+// ---------------------------------------------------------------------------
 
-    uint32_t covered = 12 + narg;
-    f |= dap_put_crc6(dap_crc6(f, covered), covered);
-    return f;
+static void dap_bits_put(uint32_t *words, uint32_t pos, uint64_t value, uint32_t nbits)
+{
+    for (uint32_t i = 0; i < nbits; i++)
+        if ((value >> i) & 1u)
+            words[(pos + i) / 32u] |= 1u << ((pos + i) % 32u);
+}
+
+static uint64_t dap_bits_get(const uint32_t *words, uint32_t pos, uint32_t nbits)
+{
+    uint64_t v = 0;
+    for (uint32_t i = 0; i < nbits && i < 64; i++)
+        v |= (uint64_t)((words[(pos + i) / 32u] >> ((pos + i) % 32u)) & 1u) << i;
+    return v;
+}
+
+// The 6 CRC bits are clocked MSB-first, so the field is read big-endian.
+static uint8_t dap_bits_get_crc_field(const uint32_t *words, uint32_t pos)
+{
+    uint8_t crc = 0;
+    for (uint32_t i = 0; i < 6; i++)
+        crc = (uint8_t)((crc << 1) | ((words[(pos + i) / 32u] >> ((pos + i) % 32u)) & 1u));
+    return crc;
+}
+
+static uint8_t dap_crc6_words(const uint32_t *words, uint32_t pos, uint32_t nbits)
+{
+    uint8_t crc = 0x01;
+    for (uint32_t i = 0; i < nbits; i++) {
+        uint8_t bit = (uint8_t)((words[(pos + i) / 32u] >> ((pos + i) % 32u)) & 1u);
+        uint8_t feedback = (uint8_t)(((crc >> 5) & 1u) ^ bit);
+        crc = (uint8_t)((crc << 1) & 0x3F);
+        if (feedback)
+            crc ^= 0x03;
+    }
+    return crc;
+}
+
+// Pack start | cmd | arglen | arg | crc6 into `data` (DAP_TX_DATA_WORDS words),
+// returning the frame length in bits, or 0 when it does not fit.
+static uint32_t dap_build_frame(uint32_t data[DAP_TX_DATA_WORDS], uint8_t cmd,
+                                uint32_t arglen, uint64_t arg)
+{
+    uint32_t narg = DAP_ARG_BITS(arglen);
+    uint32_t nbits = DAP_FRAME_BITS + narg;
+
+    if (nbits > 32u * DAP_TX_DATA_WORDS)
+        return 0;
+
+    for (uint32_t i = 0; i < DAP_TX_DATA_WORDS; i++)
+        data[i] = 0;
+
+    dap_bits_put(data, 0, 1u, 1);                // start bit
+    dap_bits_put(data, 1, cmd & 0x1Fu, 5);       // cmd
+    dap_bits_put(data, 6, arglen & 0x3Fu, 6);    // arglen
+    if (narg != 0)
+        dap_bits_put(data, 12, arg, narg);       // arg
+
+    uint8_t crc = dap_crc6_words(data, 0, 12u + narg);
+    for (uint32_t i = 0; i < 6; i++)             // crc, MSB-first
+        if ((crc >> (5 - i)) & 1u)
+            dap_bits_put(data, 12u + narg + i, 1u, 1);
+
+    return nbits;
 }
 
 // How many payload bits a command's reply carries, or 0 when it carries none.
@@ -130,6 +199,10 @@ static uint32_t dap_reply_bits(const dap_frame_t *cmd)
 {
     switch (cmd->cmd) {
     case 0x10: // sync: a fixed 32-bit pattern
+        return 32;
+    case 0x11: // dapisc: 2 bytes, sometimes with status bits OR'ed in
+        return 16;
+    case 0x02: // jtag_swap_dr: 32 bits
         return 32;
     case 0x1A: { // read_register: size encoded in the argument
         uint32_t size_code = (uint32_t)((cmd->arg >> 4) & 7u);
@@ -202,15 +275,29 @@ static dap_reply_t dap_request(uint8_t cmd, uint32_t arglen, uint64_t arg, uint3
 {
     dap_reply_t r = {0};
 
-    // A frame is start(1) + cmd(5) + len(6) + arg + crc6(6) = 18 bits without an
-    // argument, and the PIO's bit loop sends exactly this many bits (its
-    // `jmp x-- / jmp done` pair is not the N+1 form).
-    r.tx_len = 18 + (arglen == DAP_NO_ARG ? 0u : arglen);
+    // Frame: DAP_FRAME_BITS plus its argument, written into the data words
+    // (word 0 is the metadata). Three data words hold 96 bits, so dapisc's 66
+    // bits fit; arglen 0x3f means "no argument", handled by DAP_ARG_BITS.
+    r.tx_len = dap_build_frame(&tx_words[1], cmd, arglen, arg);
+    if (r.tx_len == 0) {
+        r.status = DAP_ERR_TX_BITS;
+        return r;
+    }
+    r.tx = ((uint64_t)tx_words[2] << 32) | tx_words[1]; // low 64 bits, for display
 
-    tx_words[0] = (reslen+18+32 << 7) | r.tx_len;
-    r.tx = dap_build_frame(cmd, arglen, arg);
-    tx_words[1] = (uint32_t) (r.tx & 0xFFFFFFFF);
-    tx_words[2] = (uint32_t) ((r.tx >> 32) & 0xFFFFFFFF);
+    // Word 0 field [13:7] is the reply window: reslen plus the reply's own
+    // start/CRC overhead. sync passes 21 (39 bits), dapisc 5 (23 bits). The PIO's
+    // receive loop is `jmp y--` without a guard, so it clocks one more than this.
+    uint32_t reply_clocks = reslen + DAP_FRAME_BITS;
+    uint32_t clocked = reply_clocks + 1u;
+    tx_words[0] = ((reply_clocks & 0x7Fu) << 7) | r.tx_len;
+
+    // Drain exactly the words the receive loop will push: ceil(clocked/32). A
+    // short reply (dapisc is 24 clocks) fills one word only, and arming the RX
+    // DMA for two would wait forever.
+    uint32_t nrx = (clocked + 31u) / 32u;
+    if (nrx > DAP_RX_WORDS)
+        nrx = DAP_RX_WORDS;
 
     // The state machine pulls one metadata word plus one word per 32 frame bits,
     // and stops there: queue exactly that many, or the leftover word sits in the
@@ -242,7 +329,7 @@ static dap_reply_t dap_request(uint8_t cmd, uint32_t arglen, uint64_t arg, uint3
     if (dma_channel_is_busy(dma_rx))
         dma_channel_abort(dma_rx);
     dma_channel_transfer_to_buffer_now(dma_rx, rx_words,
-                                       dma_encode_transfer_count(DAP_RX_WORDS));
+                                       dma_encode_transfer_count(nrx));
     dma_channel_transfer_from_buffer_now(dma_tx, tx_words,
                                          dma_encode_transfer_count(ntx));
 
@@ -256,7 +343,22 @@ static dap_reply_t dap_request(uint8_t cmd, uint32_t arglen, uint64_t arg, uint3
         tight_loop_contents();
     }
 
-    r.rx = ((uint64_t)rx_words[1] << 32) | rx_words[0];
+    // Combine the reply words. The ISR shifts right, so the word that holds the
+    // tail of the reply keeps those bits in its *top*: 40 clocked bits means
+    // word1 carries only 8 bits, up at positions 24..31, and must be shifted
+    // down before it can be concatenated.
+    r.rx_len = reply_clocks + 1u; // the PIO's `jmp y--` runs y+1 times
+    r.rx = 0;
+    for (uint32_t i = 0; i < DAP_RX_WORDS; i++) {
+        uint32_t first = 32u * i;
+        if (r.rx_len <= first)
+            break;
+        uint32_t in_word = r.rx_len - first;
+        uint32_t word = rx_words[i];
+        if (in_word < 32u)
+            word >>= (32u - in_word);
+        r.rx |= (uint64_t)word << first;
+    }
     r.status = DAP_OK;
     return r;
 }
@@ -269,11 +371,23 @@ static dap_reply_t dap_sync(void)
 
 static void dap_print_reply(const dap_reply_t *r)
 {
-    dap_frame_t tx = dap_parse_frame(r->tx);
-    printf("tx raw: 0x%llX (%u bits)\n", (uint64_t)r->tx, r->tx_len);
+    // Decode the command from the command words, not from r->tx: a frame longer
+    // than 64 bits (dapisc is 66) has its CRC field past the end of a uint64_t.
+    const uint32_t *tw = &tx_words[1];
+    uint8_t cmd = (uint8_t)dap_bits_get(tw, 1, 5);
+    uint32_t len = (uint32_t)dap_bits_get(tw, 6, 6);
+    uint32_t narg = DAP_ARG_BITS(len);
+    uint64_t arg = dap_bits_get(tw, 12, narg);
+    uint8_t crc_field = dap_bits_get_crc_field(tw, 12u + narg);
+    uint8_t crc_calc = dap_crc6_words(tw, 0, 12u + narg);
+
+    printf("tx: %u bits words 0x%08X 0x%08X 0x%08X\n", r->tx_len,
+           tx_words[1], tx_words[2], tx_words[3]);
     printf("tx cmd: 0x%02X (%s) len: 0x%02X arg: 0x%llX crc: 0x%02X (%s)\n",
-           tx.cmd, dap_command_name(tx.cmd), tx.arglen,
-           (uint64_t)tx.arg, tx.crc, tx.crc_ok ? "OK" : "MISMATCH");
+           cmd, dap_command_name(cmd), len, (uint64_t)arg, crc_field,
+           crc_field == crc_calc ? "OK" : "MISMATCH");
+
+    dap_frame_t tx = dap_parse_frame(r->tx); // for dap_reply_bits() below
 
     // if (r->status == DAP_ERR_TX_BITS) {
     //     printf("rx: not sent, frame is %u bits and the PIO clocks %u\n",
@@ -314,7 +428,10 @@ int main(void)
     stdio_init_all();
     sleep_ms(2000); // give a host time to attach to USB stdio
 
-    dap_init(100000);
+    // 3 MHz DAP clock (the divider is now derived from 4 SM cycles per bit, so
+    // this is the frequency actually on the wire). dapisc was measured to answer
+    // at 3 MHz and not at 200 kHz.
+    dap_init(1000000);
 
     // Two consecutive syncs on one init: the second one used to come back shifted
     // by 32 bits because the first left a word in the RX FIFO.
@@ -326,8 +443,8 @@ int main(void)
 
     // batch.dap_dapisc(48, 0x4ABBAF530F00)
     // batch.exec()
-    // dap_reply_t r3 = dap_request(17, 48, 0x4ABBAF530F00);
-    // dap_print_reply(&r3);
+    dap_reply_t r3 = dap_request(17, 48, 0x4ABBAF530F00, 5);
+    dap_print_reply(&r3);
 
     // dap_reply_t r3 = dap_request(21, 0, 0); // batch.dap_telegram(21, 0, None, 3)  
     // dap_print_reply(&r3);        // jtag_reset
