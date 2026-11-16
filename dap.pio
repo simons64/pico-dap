@@ -2,30 +2,27 @@
 
 .program dap
 .side_set 1 opt
+    ; might be a good idea to clock back to default ?
 
-    pull               side 0 ; next word; stalls while the FIFO is empty
+
     set pindirs, 1     side 0 ; data pin OUTPUT
+
+    ; metadata: tx len [bits]
+    pull               
+    out x, 7           
+    out y, 7
     
-    set x, 5           side 0 
-cmd_loop:
-    out pins, 1        side 0 [1]
-    jmp x-- cmd_loop   side 1 [1]
+next_word:
+    pull               ; next word; stalls while the FIFO is empty
 
-    mov isr, null      side 0
-
-    set x, 5           side 0
-cmd_loop2:
-    in  osr, 1
-    out pins, 1        side 0 [1]
-    jmp x-- cmd_loop2  side 1
-    
-    in  null, 26       side 1
-    mov y, isr         side 0
-
-    set x, 5           side 0
-tx_loop:
-    out pins, 1        side 0 [1]
-    jmp x-- tx_loop    side 1 [1]
+bit_loop:
+    out pins, 1          side 0 [1] ; 2 clock cycles low
+    jmp x-- more         side 1     ;
+    jmp done             side 1     ;
+more:
+    jmp !osre bit_loop   side 1     ;
+    jmp next_word        side 0     ;
+done:
 
 
     ; Data pin becomes an input: the PIO stops driving DAP1 so the target can.
@@ -44,8 +41,10 @@ tx_loop:
     ; if the jump rose the clock instead, the start bit would be clocked away).
     set x, 10   ; 10 is a random guess
 wait_start_bit:
-    jmp pin rx_loop        side 0 [1]
+    jmp pin start_bit      side 0 [1]
     jmp x-- wait_start_bit side 1 [1]
+
+start_bit:
 
 rx_loop:
     in pins, 1             side 1 [1]
@@ -56,7 +55,7 @@ rx_loop:
 
     ; Put the idle level (high) in the output latch *before* re-enabling the
     ; driver, otherwise re-driving would repeat the last data bit.
-    set pins, 1        ; idle high while still an input
+    set pins, 0        ; idle low while still an input
     set pindirs, 1     ; data pin OUTPUT again
 
 
